@@ -4,12 +4,15 @@ const app = express();
 const server = require("http").createServer(app);
 const wss = new WebSocket.Server({ server });
 const path = require("path");
+const fs = require('fs');
 
-//Include Google Speech to Text
+if (!fs.existsSync('conversations.txt')) {
+    fs.writeFileSync('conversations.txt', '');
+}
+
 const speech = require("@google-cloud/speech");
 const client = new speech.SpeechClient();
 
-//Configure Transcription Request
 const request = {
   config: {
     encoding: "MULAW",
@@ -19,11 +22,16 @@ const request = {
   interimResults: true
 };
 
-// Handle Web Socket Connection
 wss.on("connection", function connection(ws) {
 console.log("New Connection Initiated");
 
  let recognizeStream = null;
+const SILENCE_THRESHOLD = 3;
+let silenceCounter = 0;
+let currentSentence = "";
+
+// Moved silenceInterval definition here
+let silenceInterval = null; // <-- CHANGED: Moved outside of the data callback
 
   ws.on("message", function incoming(message) {
     const msg = JSON.parse(message);
@@ -31,29 +39,52 @@ console.log("New Connection Initiated");
       case "connected":
         console.log(`A new call has connected.`);
 
-        // Create Stream to the Google Speech to Text API
         recognizeStream = client
-          .streamingRecognize(request)
-          .on("error", console.error)
-          .on("data", data => {
-            console.log(data.results[0].alternatives[0].transcript);
-            wss.clients.forEach( client => {
-                if (client.readyState === WebSocket.OPEN) {
-                  client.send(
-                    JSON.stringify({
-                    event: "interim-transcription",
-                    text: data.results[0].alternatives[0].transcript
-                  })
-                );
-              }
-            });  
-          });
+            .streamingRecognize(request)
+            .on("error", console.error)
+            .on("data", data => {
+                const transcription = data.results[0].alternatives[0].transcript;
+                currentSentence += transcription + ' ';
+
+                // Reset silenceCounter only when new sentence starts
+                if (transcription.endsWith('.')) {  // <-- CHANGED: Check if transcription ends with a period
+                    silenceCounter = 0;
+                }
+
+                // Clear any existing intervals
+                if (silenceInterval) {  // <-- CHANGED: Check if an interval already exists
+                    clearInterval(silenceInterval);
+                }
+
+                silenceInterval = setInterval(() => {
+                    silenceCounter++;
+                    if (silenceCounter >= SILENCE_THRESHOLD) {
+                        clearInterval(silenceInterval);
+                        if (currentSentence.trim() !== "") {
+                            fs.writeFileSync('conversations.txt', currentSentence.trim() + '\n'); // <-- CHANGED: appendFileSync
+                            currentSentence = "";
+                        }
+                        silenceCounter = 0;
+                    }
+                }, 1000);
+
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(
+                            JSON.stringify({
+                                event: "interim-transcription",
+                                text: transcription,
+                            })
+                        );
+                    }
+                });
+            });
+
         break;
       case "start":
         console.log(`Starting Media Stream ${msg.streamSid}`);
         break;
       case "media":
-        // Write Media Packets to the recognize stream
         if (recognizeStream && !recognizeStream.destroyed) {
             recognizeStream.write(msg.media.payload);
         } else {
@@ -63,17 +94,19 @@ console.log("New Connection Initiated");
       case "stop":
         console.log(`Call Has Ended`);
         recognizeStream.destroy();
+        // Clear any existing intervals when the call ends
+        if (silenceInterval) {  // <-- CHANGED: Clear interval when call stops
+            clearInterval(silenceInterval);
+        }
         break;
     }
   });
 });
 
-//Handle HTTP Request
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "/index.html")));
 
 app.post("/", (req, res) => {
   res.set("Content-Type", "text/xml");
-
   res.send(`
     <Response>
       <Start>
